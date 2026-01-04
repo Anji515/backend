@@ -1,31 +1,19 @@
-import express from 'express';
-import mongoose, { model, Schema, Types } from 'mongoose';
-import cors from 'cors';
-import dotenv from 'dotenv';
+import express from "express";
+import mongoose, { model, Schema } from "mongoose";
+import cors from "cors";
+import dotenv from "dotenv";
+import type { Seat, Service } from "./types.js";
 
-interface Seat {
-  _id: Types.ObjectId;
-  number: number;
-  status: 'FREE' | 'LOCKED' | 'BOOKED';
-  lockedBy?: string;
-  lockedUntil?: Date;
-}
-
-interface Service {
-  name: string;
-  from: string;
-  to: string;
-  date: string;
-  departureTime: string;
-  price: number;
-  seats: Seat[];
-}
+dotenv.config();
+const app = express();
+app.use(cors());
+app.use(express.json());
 
 const SeatSchema = new Schema<Seat>({
   number: Number,
-  status: { type: String, enum: ['FREE', 'LOCKED', 'BOOKED'], default: 'FREE' },
+  status: { type: String, enum: ["FREE", "LOCKED", "BOOKED"], default: "FREE" },
   lockedBy: String,
-  lockedUntil: Date
+  lockedUntil: Date,
 });
 
 const ServiceSchema = new Schema<Service>({
@@ -35,115 +23,142 @@ const ServiceSchema = new Schema<Service>({
   date: { type: String, index: true },
   departureTime: String,
   price: Number,
-  seats: [SeatSchema]
+  seats: [SeatSchema],
 });
 
-export const ServiceModel = model<Service>('Service', ServiceSchema);
+const LOCK_DURATION = 3 * 60 * 1000;
+const CLEANUP_INTERVAL = LOCK_DURATION / 2;
 
-dotenv.config();
+export const ServiceModel = model<Service>("Service", ServiceSchema);
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-/* ================== MONGOOSE ================== */
-
-const MONGO_DB_STRING = process.env.MONGO_URI ?? ''
-
-/* ================== DB CONNECT ================== */
-
-mongoose.connect(MONGO_DB_STRING)
-  .then(() => console.log('Mongo connected')).catch(console.error);
+const MONGO_DB_STRING = process.env.MONGO_URI ?? "";
+mongoose
+  .connect(MONGO_DB_STRING)
+  .then(() => console.log("Mongo connected"))
+  .catch(() => console.error);
 
 /* ================== AUTO UNLOCK ================== */
 
 setInterval(async () => {
   const now = new Date();
   await ServiceModel.updateMany(
-    { 'seats.status': 'LOCKED', 'seats.lockedUntil': { $lt: now } },
+    { "seats.status": "LOCKED", "seats.lockedUntil": { $lt: now } },
     {
-      $set: { 'seats.$[seat].status': 'FREE' },
-      $unset: { 'seats.$[seat].lockedBy': '', 'seats.$[seat].lockedUntil': '' }
+      $set: { "seats.$[seat].status": "FREE" },
+      $unset: { "seats.$[seat].lockedBy": "", "seats.$[seat].lockedUntil": "" },
     },
-    { arrayFilters: [{ 'seat.status': 'LOCKED', 'seat.lockedUntil': { $lt: now } }] }
+    {
+      arrayFilters: [
+        { "seat.status": "LOCKED", "seat.lockedUntil": { $lt: now } },
+      ],
+    }
   );
-}, 60000);
+}, CLEANUP_INTERVAL);
 
 /* ================== ROUTES ================== */
 
 // Create service
-app.post('/api/services', async (req:any, res:any) => {
+app.post("/api/services", async (req: any, res: any) => {
   const { name, from, to, date, departureTime, price, totalSeats } = req.body;
 
-  if (!name || !from || !to || !date || !departureTime || !price || !totalSeats) {
-    return res.status(400).json({ message: 'Missing fields' });
+  if (
+    !name ||
+    !from ||
+    !to ||
+    !date ||
+    !departureTime ||
+    !price ||
+    !totalSeats
+  ) {
+    return res.status(400).json({ message: "Missing fields" });
   }
 
   const seats = Array.from({ length: totalSeats }, (_, i) => ({
     number: i + 1,
-    status: 'FREE' as 'FREE' | 'LOCKED' | 'BOOKED'
+    status: "FREE" as "FREE" | "LOCKED" | "BOOKED",
   }));
 
   const service = await ServiceModel.create({
-    name, from, to, date, departureTime, price, seats
+    name,
+    from,
+    to,
+    date,
+    departureTime,
+    price,
+    seats,
   });
 
   res.status(201).json(service);
 });
 
 // Search services
-app.get('/api/services', async (req:any, res:any) => {
+app.get("/api/services", async (req: any, res: any) => {
   const { from, to, date } = req.query;
   const services = await ServiceModel.find({ from, to, date });
   res.json(services);
 });
 
 // Get a service
-app.get('/api/services/:id', async (req:any, res:any) => {
+app.get("/api/services/:id", async (req: any, res: any) => {
   const service = await ServiceModel.findById(req.params.id);
   res.json(service);
 });
 
 // Lock Seat
-app.post('/api/services/:serviceId/seats/:seatId/lock', async (req:any, res:any) => {
-  const { serviceId, seatId } = req.params;
+app.post(
+  "/api/services/:serviceId/seats/:seatId/lock",
+  async (req: any, res: any) => {
+    const { serviceId, seatId } = req.params;
 
-  const result = await ServiceModel.updateOne(
-    { _id: serviceId, 'seats._id': seatId, 'seats.status': 'FREE' },
-    {
-      $set: {
-        'seats.$.status': 'LOCKED',
-        'seats.$.lockedUntil': new Date(Date.now() + 1 * 60 * 1000)
-      }
+    const service = await ServiceModel.findById(serviceId);
+    if (!service) return res.status(404).json({ message: "Service not found" });
+
+    const seat = service.seats.find((seat) => seat._id.toString() === seatId);
+    if (!seat) return res.status(404).json({ message: "Seat not found" });
+
+    if (seat.status == "LOCKED") {
+      return res.status(409).json({ message: "Selected seat is already locked" });
     }
-  );
+    if (seat.status == "BOOKED") {
+      return res.status(409).json({ message: "Seat already booked" });
+    }
 
-  if (result.modifiedCount === 0)
-    return res.status(409).json({ message: 'Seat not available' });
+    seat.status = "LOCKED";
+    seat.lockedUntil = new Date(Date.now() + LOCK_DURATION);
+    await service.save();
 
-  res.json({ message: 'Seat locked for 5 minutes' });
-});
+    res.json({ message: "Seat locked", lockedUntil: seat.lockedUntil });
+  }
+);
 
 // Book Seat
-app.post('/api/services/:serviceId/seats/:seatId/book', async (req:any, res:any) => {
-  const { serviceId, seatId } = req.params;
+app.post(
+  "/api/services/:serviceId/seats/:seatId/book",
+  async (req: any, res: any) => {
+    const { serviceId, seatId } = req.params;
 
-  const result = await ServiceModel.updateOne(
-    {
-      _id: serviceId,
-      'seats._id': seatId,
-      'seats.status': 'LOCKED',
-    },
-    {
-      $set: { 'seats.$.status': 'BOOKED' },
-      $unset: { 'seats.$.lockedBy': '', 'seats.$.lockedUntil': '' }
+    const service = await ServiceModel.findById(serviceId);
+    if (!service) return res.status(404).json({ message: "Service not found" });
+
+    const seat = service.seats.find((seat) => seat._id.toString() === seatId);
+    if (!seat) return res.status(404).json({ message: "Seat not found" });
+
+    if (seat.status === "FREE") {
+      return res.status(409).json({ message: "Seat is not locked yet" });
     }
-  );
 
-  if (result.modifiedCount === 0)
-    return res.status(403).json({ message: 'Cannot book seat' });
+    if (seat.status === "BOOKED") {
+      return res.status(409).json({ message: "Seat already booked" });
+    }
 
-  res.json({ message: 'Seat booked' });
-});
+    seat.status = "BOOKED";
+    seat.lockedBy = undefined;
+    seat.lockedUntil = undefined;
 
-app.listen(4000, () => console.log('Server running on 4000'));
+    await service.save();
+
+    res.json({ message: "Seat booked" });
+  }
+);
+
+app.listen(4000, () => console.log("Server running on 4000"));
